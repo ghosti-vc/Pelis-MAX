@@ -798,26 +798,10 @@ function embedOf(t) {
 // ---- PelisGO ---------------------------------------------------------------------------------------
 // El sitio (Next.js) guarda sus datos en "self.__next_f.push([1,\"...\"])": se juntan y se desescapan.
 function rscText(h) {
-  // Recorrido a mano: la expresión regular sobre páginas enormes agotaba la memoria ("out of memory in regexp").
-  const key = 'self.__next_f.push([1,"';
   let t = "";
-  let i = 0;
-  while ((i = h.indexOf(key, i)) >= 0) {
-    const st = i + key.length;
-    let k = st;
-    let end = -1;
-    while (true) {
-      const q = h.indexOf('"', k);
-      if (q < 0) break;
-      let bs = 0;
-      while (h.charCodeAt(q - 1 - bs) === 92) bs++;
-      if (bs % 2 === 0) { end = q; break; }
-      k = q + 1;
-    }
-    if (end < 0) break;
-    t += jsonStr(h.slice(st, end));
-    i = end;
-  }
+  const re = /self\.__next_f\.push\(\[1,"((?:[^"\\]|\\[\s\S])*)"\]\)/g;
+  let m;
+  while ((m = re.exec(h))) t += jsonStr(m[1]);
   return t;
 }
 const PG_LANG = { cmm5jys20000d12uxchnk1lg7: 0, cmm5jys2d000e12ux0nymuwh4: 1 };
@@ -1273,44 +1257,13 @@ export async function resolve(ref) {
   const left = () => total - (Date.now() - t0);
 
   // 1) servidores de todas las fuentes, a la vez
+  const got = await Promise.allSettled(refs.map((r) => withTimeout(candidatesOf(r.slice(0, 2), r.slice(3)), 8000)));
   let cands = [];
   let lastErr = null;
-  const slots = refs.map((r) => {
-    const o = { done: false, ok: false, v: [] };
-    o.p = withTimeout(candidatesOf(r.slice(0, 2), r.slice(3)), 8000).then((v) => { o.ok = true; o.v = v; },
-      (e) => { lastErr = e; log("resolve: " + r.slice(0, 2) + " sin servidores (" + String((e && e.message) || e).slice(0, 40) + ")"); }).then(() => { o.done = true; });
-    return o;
+  got.forEach((g, i) => {
+    if (g.status === "fulfilled") cands = cands.concat(g.value);
+    else { lastErr = g.reason; log("resolve: " + refs[i].slice(0, 2) + " sin servidores (" + String((g.reason && g.reason.message) || g.reason).slice(0, 40) + ")"); }
   });
-  // En cuanto una fuente entrega servidores se espera solo 1,5 s más a las demás (antes se esperaba a la más lenta, hasta 8 s).
-  {
-    const tg = Date.now();
-    let first = 0;
-    while (Date.now() - tg < 8500 && !slots.every((o) => o.done)) {
-      if (!first && slots.some((o) => o.ok && o.v.length)) first = Date.now();
-      if (first && Date.now() - first > 1500) break;
-      await kino.sleep(100);
-    }
-  }
-  slots.forEach((o) => { if (o.ok) cands = cands.concat(o.v); });
-  // PelisGO a veces rechaza su API (403) y solo queda abrir la página en el navegador: se buscan antes los mismos títulos en las otras fuentes.
-  const ttm = /(?:^|\|\|)tt:([^|:]*):([ms])/.exec(raw);
-  if (ttm && ttm[2] === "m" && !refs.some((r) => r.slice(0, 2) !== "pg") && (!cands.length || cands.every((c) => c.cap))) {
-    try {
-      const title = dec(ttm[1]);
-      const want = normTitle(title);
-      const alts = await Promise.allSettled([["ry", rySearch], ["pe", peSearch], ["op", opSearch]].map(async ([src, f]) => {
-        const items = await withTimeout(f(title), 5000);
-        const it = items.find((x) => x.kind === "movie" && normTitle(x.title) === want);
-        if (!it) return [];
-        const r = String(it.ref).split("||")[0];
-        return withTimeout(candidatesOf(src, r.slice(3)), 6000);
-      }));
-      const extra = [];
-      alts.forEach((a) => { if (a.status === "fulfilled") extra.push.apply(extra, a.value); });
-      log("resolve: respaldo por título: " + extra.length + " servidores");
-      if (extra.length) cands = extra.concat(cands);
-    } catch (e) { log("resolve: respaldo falló " + String((e && e.message) || e).slice(0, 40)); }
-  }
   cands = cands.filter((c, i) => cands.findIndex((x) => x.url === c.url) === i);
   const useless = (c) => /dood|playmogo|doodstream|mixdrop|susanexpect|nupload|netu|waaw|hqq/i.test(hostOf(c.url));
   const usable = cands.filter((c) => !useless(c));

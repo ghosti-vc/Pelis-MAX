@@ -1334,12 +1334,23 @@ export async function resolve(ref) {
     else { lastErr = g.reason; log("resolve: " + refs[i].slice(0, 2) + " sin servidores (" + String((g.reason && g.reason.message) || g.reason).slice(0, 40) + ")"); }
   });
   // Respaldo: si la fuente no dio servidores reales, se busca el mismo título en las demás fuentes.
+  let didBackup = false;
   if (ttRef && (!cands.length || cands.every((c) => c.cap)) && left() > 9000) {
+    didBackup = true;
     log("resolve: sin servidores reales, busco el título en otras fuentes");
     const more = await findMoreRefs(ttRef, refs, ttRef.split(":")[2] === "m" ? "m" : "s", 6000);
     log("resolve: otras fuentes encontradas=" + more.length);
     const extra = await Promise.allSettled(more.map((r) => withTimeout(candidatesOf(r.slice(0, 2), r.slice(3)), 6000)));
     extra.forEach((g) => { if (g.status === "fulfilled") cands = cands.concat(g.value); });
+  }
+  // Respaldo en paralelo: mientras se prueban estos servidores, se busca el mismo título en las demás fuentes.
+  let backupP = null;
+  if (ttRef && !didBackup && left() > 8000) {
+    const kindB = ttRef.split(":")[2] === "m" ? "m" : "s";
+    backupP = findMoreRefs(ttRef, refs, kindB, 5000)
+      .then((more) => { log("resolve: respaldo, otras fuentes encontradas=" + more.length); return Promise.allSettled(more.map((r) => withTimeout(candidatesOf(r.slice(0, 2), r.slice(3)), 6000))); })
+      .then((rs) => { const o = []; rs.forEach((g) => { if (g.status === "fulfilled") g.value.forEach((c) => o.push(c)); }); return o; })
+      .catch(() => []);
   }
   cands = cands.filter((c, i) => cands.findIndex((x) => x.url === c.url) === i);
   const useless = (c) => /dood|playmogo|doodstream|mixdrop|susanexpect|nupload|netu|waaw|hqq/i.test(hostOf(c.url));
@@ -1360,6 +1371,7 @@ export async function resolve(ref) {
 
   // 3) reproductores: de 4 en 4 sin soltar los anteriores; gana el primero que entregue video que abra.
   const embeds = cands.filter((c) => !isDirect(c) && !c.cap);
+  const allEmbeds = embeds.slice();
   const capCands = cands.filter((c) => c.cap);
   const BAD = /dood|playmogo|mixdrop|susanexpect|waaw|hqq|netu|nupload/i;
   const browserOk = typeof kino.browser === "object" && kino.browser && typeof kino.browser.capture === "function";
@@ -1383,7 +1395,7 @@ export async function resolve(ref) {
   };
   const startCapture = () => {
     if (captureStarted || !browserOk || winner) return;
-    const fe = capCands[0] || embeds.find((c) => !BAD.test(hostOf(c.url))) || embeds[0];
+    const fe = capCands[0] || allEmbeds.find((c) => !BAD.test(hostOf(c.url))) || allEmbeds[0];
     if (!fe || left() < 5000) return;
     captureStarted = true;
     pending++;
@@ -1400,11 +1412,35 @@ export async function resolve(ref) {
       await kino.sleep(200);
     }
   };
-  for (let i = 0; i < embeds.length && left() > 4500 && !winner; i += 4) {
-    embeds.slice(i, i + 4).forEach(start);
-    await waitFor(Math.min(3500, left() - 3500));
-    if (!winner) startCapture();
-  }
+  let backupDone = !backupP;
+  const mergeBackup = async (ms) => {
+    if (backupDone || ms < 300) return;
+    let extra;
+    try { extra = await withTimeout(backupP, ms); } catch (e) { return; }
+    backupDone = true;
+    const fresh = (extra || []).filter((c) => !useless(c) && !cands.some((x) => x.url === c.url));
+    fresh.sort((x, y) => ((x.lang || 0) * 10 + rank(x.url)) - ((y.lang || 0) * 10 + rank(y.url)));
+    log("resolve: respaldo aporta " + fresh.length + " servidores");
+    for (const c of fresh) {
+      if (c.cap) continue;
+      cands.push(c);
+      if (!isDirect(c)) { embeds.push(c); allEmbeds.push(c); continue; }
+      if (!winner && left() > 3000) {
+        const ok = await directWorks(c);
+        if (ok) { winner = { v: ok, l: c.lang || 0 }; log("resolve: ganó (respaldo directo) " + hostOf(c.url) + " · " + (c.label || "")); }
+      }
+    }
+  };
+  const rounds = async () => {
+    while (embeds.length && left() > 4500 && !winner) {
+      embeds.splice(0, 4).forEach(start);
+      await waitFor(Math.min(3500, left() - 3500));
+      if (!winner) await mergeBackup(Math.min(2500, left() - 3500));
+      if (!winner && !embeds.length) startCapture();
+    }
+  };
+  await rounds();
+  if (!winner) { await mergeBackup(Math.min(4000, left() - 3000)); await rounds(); }
   if (!winner) startCapture();
   if (!winner && pending > 0 && left() > 1500) await waitFor(Math.max(1500, left() - 2500));
   if (winner) {

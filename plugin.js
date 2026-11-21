@@ -919,6 +919,12 @@ async function pgSession(page, base) {
         if (ck) extra.Cookie = ck;
         try {
           const j = JSON.parse(txt);
+          log("pg: session/sync campos=" + Object.keys(j || {}).map((k) => k + ":" + typeof j[k] + (typeof j[k] === "string" ? "(" + j[k].length + ")" : "")).join(","));
+          if (j && typeof j.sid === "string" && j.sid.length > 8) {
+            const c = ["sid", "session", "sessionId"].map((n) => n + "=" + j.sid).join("; ");
+            extra.Cookie = ck ? ck + "; " + c : c;
+            extra["X-Session-Id"] = j.sid;
+          }
           const tk = j && (j.token || j.accessToken || j.sessionToken || (j.data && (j.data.token || j.data.accessToken)));
           if (typeof tk === "string" && tk.length > 8) extra.Authorization = "Bearer " + tk;
         } catch (e) { /* sin JSON */ }
@@ -968,8 +974,9 @@ async function pgCandidates(spec) {
       try { await getText(page, { "User-Agent": UA, Referer: PG + "/" }); } catch (e) { /* sigue */ }
       r = await kino.fetch(PG + "/api/movies/" + id + "/stream", { headers: Object.assign({}, apiHeaders, await pgSession(page, apiHeaders)) });
     }
-    const txt = r.ok ? await r.text() : "";
+    let txt = await r.text();
     log("pg: api stream status=" + r.status + " bytes=" + txt.length + (txt ? " inicio=" + redact(txt.slice(0, 100)) : ""));
+    if (!r.ok) txt = "";
     if (txt) { try { walkLinks(JSON.parse(txt), cands, undefined); } catch (e) { cands = pgLinks(txt, null); } }
   } catch (e) { log("pg: api stream falló " + String((e && e.message) || e).slice(0, 50)); }
   if (!cands.length) {

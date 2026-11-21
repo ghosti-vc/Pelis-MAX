@@ -912,9 +912,15 @@ async function pgCandidates(spec) {
   const page = PG + "/movies/" + slug;
   let cands = [];
   try {
-    const r = await kino.fetch(PG + "/api/movies/" + id + "/stream", { headers: { Accept: "application/json, text/plain, */*", Referer: page, Origin: PG } });
+    const apiHeaders = { "User-Agent": UA, Accept: "application/json, text/plain, */*", "Accept-Language": "es-MX,es;q=0.9", Referer: page, Origin: PG, "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-origin" };
+    let r = await kino.fetch(PG + "/api/movies/" + id + "/stream", { headers: apiHeaders });
+    if (r.status === 403) {
+      log("pg: api stream 403, abro la página y reintento una vez");
+      try { await getText(page, { "User-Agent": UA, Referer: PG + "/" }); } catch (e) { /* sigue */ }
+      r = await kino.fetch(PG + "/api/movies/" + id + "/stream", { headers: apiHeaders });
+    }
     const txt = r.ok ? await r.text() : "";
-    log("pg: api stream status=" + r.status + " bytes=" + txt.length);
+    log("pg: api stream status=" + r.status + " bytes=" + txt.length + (txt ? " inicio=" + redact(txt.slice(0, 100)) : ""));
     if (txt) { try { walkLinks(JSON.parse(txt), cands, undefined); } catch (e) { cands = pgLinks(txt, null); } }
   } catch (e) { log("pg: api stream falló " + String((e && e.message) || e).slice(0, 50)); }
   if (!cands.length) {
@@ -1161,7 +1167,7 @@ export async function episodes(ref) {
     const more = tt ? await findMoreRefs(tt, known, "m", 3500) : [];
     const all = known.concat(more).sort((a, b) => (SRC_PRIO[a.slice(0, 2)] || 0) - (SRC_PRIO[b.slice(0, 2)] || 0)).slice(0, 8);
     if (!all.length) throw kino.error("not_found", "referencia desconocida");
-    return { series: { title: "" }, episodes: [{ season: 1, number: 1, ref: "mx|" + all.join("||"), title: tr("Película", "Movie") }] };
+    return { series: { title: "" }, episodes: [{ season: 1, number: 1, ref: "mx|" + all.join("||") + (tt ? "||" + tt : ""), title: tr("Película", "Movie") }] };
   }
 
   // Serie: las fuentes conocidas cargan YA mientras se buscan las demás.
@@ -1253,6 +1259,7 @@ export async function resolve(ref) {
   const raw = String(ref || "");
   const refs = (raw.startsWith("mx|") ? raw.slice(3) : raw).split("||").filter((x) => x && x.indexOf("tt:") !== 0).slice(0, 8);
   if (!refs.length) throw kino.error("not_found", "referencia desconocida");
+  const ttRef = (raw.startsWith("mx|") ? raw.slice(3) : raw).split("||").find((x) => x.indexOf("tt:") === 0) || null;
   const total = 20000;
   const left = () => total - (Date.now() - t0);
 
@@ -1264,6 +1271,14 @@ export async function resolve(ref) {
     if (g.status === "fulfilled") cands = cands.concat(g.value);
     else { lastErr = g.reason; log("resolve: " + refs[i].slice(0, 2) + " sin servidores (" + String((g.reason && g.reason.message) || g.reason).slice(0, 40) + ")"); }
   });
+  // Respaldo: si la fuente no dio servidores reales, se busca el mismo título en las demás fuentes.
+  if (ttRef && (!cands.length || cands.every((c) => c.cap)) && left() > 9000) {
+    log("resolve: sin servidores reales, busco el título en otras fuentes");
+    const more = await findMoreRefs(ttRef, refs, ttRef.split(":")[2] === "m" ? "m" : "s", 6000);
+    log("resolve: otras fuentes encontradas=" + more.length);
+    const extra = await Promise.allSettled(more.map((r) => withTimeout(candidatesOf(r.slice(0, 2), r.slice(3)), 6000)));
+    extra.forEach((g) => { if (g.status === "fulfilled") cands = cands.concat(g.value); });
+  }
   cands = cands.filter((c, i) => cands.findIndex((x) => x.url === c.url) === i);
   const useless = (c) => /dood|playmogo|doodstream|mixdrop|susanexpect|nupload|netu|waaw|hqq/i.test(hostOf(c.url));
   const usable = cands.filter((c) => !useless(c));
@@ -1274,7 +1289,7 @@ export async function resolve(ref) {
   // 2) enlaces directos del mejor idioma
   const minLang = cands.length ? Math.min(...cands.map((c) => c.lang || 0)) : 0;
   const bd = cands.find((c) => isDirect(c) && (c.lang || 0) === minLang);
-  if (bd) return asDirect(bd);
+  if (bd) { log("resolve: ganó (directo) " + hostOf(bd.url) + " · " + (bd.label || "")); return asDirect(bd); }
 
   // 3) reproductores: de 4 en 4 sin soltar los anteriores; gana el primero que entregue video que abra.
   const embeds = cands.filter((c) => !isDirect(c) && !c.cap);
@@ -1289,7 +1304,7 @@ export async function resolve(ref) {
   const accept = async (v, c) => {
     v.label = c.label;
     const l = c.lang || 0;
-    if (await verifyMedia(v)) { if (!winner || l < winner.l) winner = { v, l }; }
+    if (await verifyMedia(v)) { if (!winner || l < winner.l) { winner = { v, l }; log("resolve: ganó " + hostOf(c.url) + " · " + (c.label || "")); } }
     else { log("resolve: el video de " + hostOf(c.url) + " no abre, se descarta"); if (!fallback && !BAD.test(hostOf(c.url))) fallback = v; }
   };
   const start = (c) => {

@@ -1303,6 +1303,18 @@ async function verifyMedia(m) {
   } catch (e) { return false; }
 }
 
+async function directWorks(c) {
+  const org = (/^(https?:\/\/[^\/?#]+)/i.exec(c.url) || [])[1] || "";
+  const refs = [c.referer || REF, "https://lulustream.com/", "https://luluvdo.com/", org + "/"].filter((x, i, a) => x && a.indexOf(x) === i);
+  const tries = refs.map((r) => {
+    const m = { url: c.url, mime: /\.m3u8/i.test(c.url) ? "application/x-mpegurl" : "video/mp4", label: c.label, headers: playHeaders(r) };
+    return verifyMedia(m).then((ok) => (ok ? { m, r } : null), () => null);
+  });
+  const res = await Promise.all(tries);
+  const hit = res.find(Boolean);
+  if (hit) log("resolve: directo abre con referer " + hostOf(hit.r));
+  return hit ? hit.m : null;
+}
 export async function resolve(ref) {
   await null;
   const t0 = Date.now();
@@ -1339,7 +1351,12 @@ export async function resolve(ref) {
   // 2) enlaces directos del mejor idioma
   const minLang = cands.length ? Math.min(...cands.map((c) => c.lang || 0)) : 0;
   const bd = cands.find((c) => isDirect(c) && (c.lang || 0) === minLang);
-  if (bd) { log("resolve: ganó (directo) " + hostOf(bd.url) + " · " + (bd.label || "")); return asDirect(bd); }
+  if (bd) {
+    // Un enlace directo no vale si el servidor lo rechaza (403): se prueba con las cabeceras de su reproductor y, si no abre, se sigue con los demás.
+    const ok = await directWorks(bd);
+    if (ok) { log("resolve: ganó (directo) " + hostOf(bd.url) + " · " + (bd.label || "")); return ok; }
+    log("resolve: el enlace directo de " + hostOf(bd.url) + " no abre, sigo con los demás servidores");
+  }
 
   // 3) reproductores: de 4 en 4 sin soltar los anteriores; gana el primero que entregue video que abra.
   const embeds = cands.filter((c) => !isDirect(c) && !c.cap);

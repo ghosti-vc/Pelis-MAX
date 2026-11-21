@@ -826,6 +826,22 @@ async function pgPage(kind, n) {
 }
 async function pgSearch(q) {
   const want = normTitle(q);
+  try {
+    const r = await kino.fetch(PG + "/api/search?q=" + enc(q) + "&limit=24", { headers: pgHeaders(), timeoutMs: 7000 });
+    if (r.ok) {
+      const j = JSON.parse(await r.text());
+      const res = j && Array.isArray(j.results) ? j.results : [];
+      const apiOut = [];
+      for (const x of res) {
+        if (!x || !x.id || !x.slug) continue;
+        const isMovie = !(x.type === "serie" || x.type === "series" || x.type === "tv");
+        const it = mkItem("pg", isMovie ? "movie" : "series", enc(x.slug) + (isMovie ? "|" + x.id : ""), x.title, x.poster, x.year);
+        if (it) apiOut.push(it);
+      }
+      log("pg: búsqueda por API -> " + apiOut.length);
+      if (apiOut.length) return apiOut;
+    }
+  } catch (e) { log("pg: búsqueda por API falló " + String((e && e.message) || e).slice(0, 40)); }
   const urls = [PG + "/search?q=" + enc(q), PG + "/movies?search=" + enc(q), PG + "/movies?q=" + enc(q), PG + "/series?search=" + enc(q), PG + "/search?query=" + enc(q)];
   const res = await Promise.allSettled(urls.map(async (u) => pgCards(await getText(u, { Referer: PG + "/" }))));
   const out = [];
@@ -892,47 +908,50 @@ function walkLinks(o, out, lang) {
   if (!o || typeof o !== "object") return;
   if (Array.isArray(o)) { o.forEach((x) => walkLinks(x, out, lang)); return; }
   let l = lang;
-  const lg = o.languageId || (o.language && (o.language.id || o.language.name)) || o.lang;
+  const lg = o.languageId || (o.language && (typeof o.language === "string" ? o.language : o.language.id || o.language.name)) || o.lang;
   if (lg) l = PG_LANG[lg] !== undefined ? PG_LANG[lg] : langRank(lg);
   const u = o.url || o.embedUrl || o.embed_url || o.link;
   if (typeof u === "string" && /^https?:\/\//i.test(u) && !/\.(jpe?g|png|webp|gif)(\?|$)/i.test(u) && !o.isBroken) out.push({ url: u, lang: l === undefined ? 0 : l, label: "PelisGO · " + LANG_NAME[l === undefined ? 0 : l], referer: PG + "/" });
   Object.keys(o).forEach((k) => { if (o[k] && typeof o[k] === "object") walkLinks(o[k], out, l); });
 }
-function cookieFrom(r) {
-  try {
-    const raw = r.headers && typeof r.headers.get === "function" ? (r.headers.get("set-cookie") || "") : "";
-    return String(raw).split(/,(?=\s*[^;,=\s]+=)/).map((c) => c.split(";")[0].trim()).filter((c) => c.indexOf("=") > 0).join("; ");
-  } catch (e) { return ""; }
+// Cabeceras de la app web de PelisGO (copiadas del plugin que sí reproduce).
+function pgHeaders(referer) {
+  return { Origin: PG, Accept: "*/*", "Accept-Language": "es-ES,es;q=0.9", "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-origin", "X-Requested-With": "XMLHttpRequest", Referer: referer || PG + "/", "User-Agent": UA };
 }
-// Pide la sesión anónima. Devuelve cabeceras extra (cookie o token) si el sitio las entrega.
-async function pgSession(page, base) {
-  const extra = {};
-  for (const method of ["POST", "GET"]) {
-    try {
-      const opts = { method, headers: Object.assign({}, base) };
-      if (method === "POST") { opts.headers["Content-Type"] = "application/json"; opts.body = "{}"; }
-      const r = await kino.fetch(PG + "/api/session/sync", opts);
-      const txt = await r.text();
-      const ck = cookieFrom(r);
-      log("pg: session/sync " + method + " status=" + r.status + " bytes=" + txt.length + " cookie=" + (ck ? "sí" : "no") + (txt ? " inicio=" + redact(txt.slice(0, 120)) : ""));
-      if (r.ok) {
-        if (ck) extra.Cookie = ck;
-        try {
-          const j = JSON.parse(txt);
-          log("pg: session/sync campos=" + Object.keys(j || {}).map((k) => k + ":" + typeof j[k] + (typeof j[k] === "string" ? "(" + j[k].length + ")" : "")).join(","));
-          if (j && typeof j.sid === "string" && j.sid.length > 8) {
-            const c = ["sid", "session", "sessionId"].map((n) => n + "=" + j.sid).join("; ");
-            extra.Cookie = ck ? ck + "; " + c : c;
-            extra["X-Session-Id"] = j.sid;
-          }
-          const tk = j && (j.token || j.accessToken || j.sessionToken || (j.data && (j.data.token || j.data.accessToken)));
-          if (typeof tk === "string" && tk.length > 8) extra.Authorization = "Bearer " + tk;
-        } catch (e) { /* sin JSON */ }
-        return extra;
-      }
-    } catch (e) { log("pg: session/sync " + method + " falló " + String((e && e.message) || e).slice(0, 50)); }
+let pgTok = { token: null, exp: 0 };
+async function pgToken() {
+  const now = Date.now();
+  if (pgTok.token && now < pgTok.exp) return pgTok.token;
+  try {
+    const r = await kino.fetch(PG + "/api/session/sync", { method: "POST", headers: Object.assign({ "Content-Type": "application/json" }, pgHeaders()), timeoutMs: 8000 });
+    const txt = await r.text();
+    log("pg: session/sync status=" + r.status + " bytes=" + txt.length);
+    if (!r.ok) return null;
+    const j = JSON.parse(txt);
+    const tok = j && (j.sid || j.sessionId || j.token);
+    if (tok) { pgTok = { token: String(tok), exp: now + 9 * 60 * 1000 }; return pgTok.token; }
+  } catch (e) { log("pg: session/sync falló " + String((e && e.message) || e).slice(0, 50)); }
+  return null;
+}
+// Lista de servidores de una película o capítulo: sesión anónima + cabecera x-session-id; un reintento si la sesión no vale.
+async function pgStream(kind, id, referer) {
+  const url = PG + (kind === "episode" ? "/api/series/episode/" + enc(id) + "/stream" : "/api/movies/" + enc(id) + "/stream");
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const token = await pgToken();
+    const h = pgHeaders(referer);
+    if (token) h["x-session-id"] = token;
+    const r = await kino.fetch(url, { headers: h, timeoutMs: 8000 });
+    const txt = await r.text();
+    let j = null;
+    try { j = JSON.parse(txt); } catch (e) { j = null; }
+    log("pg: stream " + kind + " intento " + (attempt + 1) + " status=" + r.status + " bytes=" + txt.length + (r.ok ? "" : " cuerpo=" + redact(txt.slice(0, 80))));
+    if (r.status === 401 || r.status === 403 || (j && typeof j.error === "string" && /sesi[oó]n/i.test(j.error))) { pgTok = { token: null, exp: 0 }; continue; }
+    if (!r.ok || !j) return [];
+    const out = [];
+    walkLinks(j, out, undefined);
+    return out;
   }
-  return extra;
+  return [];
 }
 async function pgCandidates(spec) {
   const p = spec.split("|");
@@ -943,19 +962,7 @@ async function pgCandidates(spec) {
     const own = (/"episodeId":"(\w+)","episodeTitle"/.exec(t) || [])[1];
     let found = pgLinks(t, own);
     if (!found.length && own) {
-      // Igual que en las películas: sesión anónima y luego la lista de servidores del capítulo.
-      try {
-        const hd = { "User-Agent": UA, Accept: "application/json, text/plain, */*", "Accept-Language": "es-MX,es;q=0.9", Referer: page, Origin: PG, "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-origin" };
-        const sh = Object.assign({}, hd, await pgSession(page, hd));
-        let r = await kino.fetch(PG + "/api/series/episode/" + own + "/stream", { headers: sh });
-        if (r.status === 403 || r.status === 401) {
-          log("pg: stream de capítulo " + r.status + ", reintento");
-          r = await kino.fetch(PG + "/api/series/episode/" + own + "/stream", { headers: Object.assign({}, hd, await pgSession(page, hd)) });
-        }
-        const txt = r.ok ? await r.text() : "";
-        log("pg: stream de capítulo status=" + r.status + " bytes=" + txt.length + (txt ? " inicio=" + redact(txt.slice(0, 100)) : ""));
-        if (txt) { try { walkLinks(JSON.parse(txt), found, undefined); } catch (e) { found = pgLinks(txt, null); } }
-      } catch (e) { log("pg: stream de capítulo falló " + String((e && e.message) || e).slice(0, 50)); }
+      try { found = await pgStream("episode", own, page); } catch (e) { log("pg: stream de capítulo falló " + String((e && e.message) || e).slice(0, 50)); }
     }
     return found;
   }
@@ -964,20 +971,7 @@ async function pgCandidates(spec) {
   const page = PG + "/movies/" + slug;
   let cands = [];
   try {
-    const apiHeaders = { "User-Agent": UA, Accept: "application/json, text/plain, */*", "Accept-Language": "es-MX,es;q=0.9", Referer: page, Origin: PG, "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-origin" };
-    // El sitio crea una sesión anónima en /api/session/sync antes de pedir los servidores; se hace lo mismo.
-    const sess = await pgSession(page, apiHeaders);
-    const sh = Object.assign({}, apiHeaders, sess);
-    let r = await kino.fetch(PG + "/api/movies/" + id + "/stream", { headers: sh });
-    if (r.status === 403 || r.status === 401) {
-      log("pg: api stream " + r.status + ", abro la página y reintento una vez");
-      try { await getText(page, { "User-Agent": UA, Referer: PG + "/" }); } catch (e) { /* sigue */ }
-      r = await kino.fetch(PG + "/api/movies/" + id + "/stream", { headers: Object.assign({}, apiHeaders, await pgSession(page, apiHeaders)) });
-    }
-    let txt = await r.text();
-    log("pg: api stream status=" + r.status + " bytes=" + txt.length + (txt ? " inicio=" + redact(txt.slice(0, 100)) : ""));
-    if (!r.ok) txt = "";
-    if (txt) { try { walkLinks(JSON.parse(txt), cands, undefined); } catch (e) { cands = pgLinks(txt, null); } }
+    cands = await pgStream("movie", id, page);
   } catch (e) { log("pg: api stream falló " + String((e && e.message) || e).slice(0, 50)); }
   if (!cands.length) {
     try { cands = pgLinks(rscText(await getText(page, { Referer: PG + "/" })), null); } catch (e) { /* sin página */ }

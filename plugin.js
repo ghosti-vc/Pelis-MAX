@@ -78,7 +78,7 @@ const MEDIA_RE = /["'`]((?:https?:)?\/\/[^"'`\s<>\\]+?\.(?:m3u8|mp4)(?:\?[^"'`\s
 
 // Videos de prueba que traen los reproductores y sus librerías (Big Buck Bunny y compañía).
 // Nunca son el capítulo: se descartan para no mostrarlos por error.
-const DEMO_MEDIA = /big[_-]?buck[_-]?bunny|\bbbb[_-]|sintel|elephants?[_-]?dream|tears[_-]?of[_-]?steel|gtv-videos-bucket|commondatastorage|test-?streams|bitdash|bitmovin|mux\.dev|zencdn|oceans\.mp4|flowplayer\.com|jwplatform|\/samples?\/|(?:googleapis|gstatic|jsdelivr|cdnjs|unpkg)\./i;
+const DEMO_MEDIA = /pinup_preroll|[_\/-]preroll[_.\/-]|agl00\d\.com|big[_-]?buck[_-]?bunny|\bbbb[_-]|sintel|elephants?[_-]?dream|tears[_-]?of[_-]?steel|gtv-videos-bucket|commondatastorage|test-?streams|bitdash|bitmovin|mux\.dev|zencdn|oceans\.mp4|flowplayer\.com|jwplatform|\/samples?\/|(?:googleapis|gstatic|jsdelivr|cdnjs|unpkg)\./i;
 // Los enlaces de streamtape.com/e/... son la página del reproductor (no el video) y el sitio responde 403: se descartan.
 const isDemo = (u) => DEMO_MEDIA.test(String(u || "")) || /streamtape\.[a-z]+\/e\//i.test(String(u || ""));
 
@@ -1006,8 +1006,8 @@ function genreParts(slug) {
   return [(n) => opPage(n, "/genero/" + slug + "/"), (n) => ryPath("/category/" + slug + "/", n), (n) => pePath("/category/" + slug + "/", n), (n) => pgGenre(slug, n)];
 }
 const SECTIONS = {
-  peliculas: { genre: "peliculas", parts: [(n) => pgPage("movie", n), (n) => ryPage("movie", n), (n) => opPage(n), (n) => pePage("movie", n)] },
-  series: { genre: "series", parts: [(n) => pgPage("serie", n), (n) => ryPage("serie", n), (n) => pePage("series", n)] },
+  peliculas: { genre: "peliculas", parts: [(n) => pgPage("movie", n), (n) => opPage(n), (n) => pePage("movie", n), (n) => acPage("movies", n), (n) => ryPage("movie", n)] },
+  series: { genre: "series", parts: [(n) => pgPage("serie", n), (n) => pePage("series", n), (n) => acPage("tvshows", n), (n) => ryPage("serie", n)] },
   anime: { genre: "series", parts: [(n) => pePage("anime", n)] },
   estrenos: { genre: "peliculas", parts: [(n) => opPage(n, "/estreno/2026/"), (n) => pgPage("movie", n)] },
   tendencias: { genre: "peliculas", parts: [(n) => peTrend(n), (n) => pgPage("movie", n)] },
@@ -1020,7 +1020,7 @@ const SECTIONS = {
   disney: { genre: "peliculas", parts: [(n) => ryPath("/category/disney/", n), (n) => pePath("/category/disney/", n), (n) => ryPath("/category/pixar/", n)] },
   superheroes: { genre: "peliculas", parts: [(n) => ryPath("/category/superheroes/", n), (n) => pePath("/category/superheroes/", n)] },
 };
-const SRC_PRIO = { pg: 0, ry: 1, pe: 2, op: 3 };
+const SRC_PRIO = { pg: 0, pe: 1, op: 2, ac: 3, ry: 9 };
 
 function normTitle(t) {
   return String(t || "").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/\(\d{4}\)/g, "").replace(/[^a-z0-9]+/g, "");
@@ -1141,8 +1141,100 @@ export async function categories() {
 }
 
 const deadUntil = {};
+// ====================================================================================================
+//  ALLCALIDAD (motor con API: /api/rest/search, /episodes y /player)
+// ====================================================================================================
+const AC = "https://allcalidad.re";
+async function acJson(path) {
+  const r = await kino.fetch(AC + "/api/rest" + path, { headers: { "User-Agent": UA, Accept: "application/json, text/plain, */*", Referer: AC + "/" }, timeoutMs: 8000 });
+  const t = await r.text();
+  if (!r.ok) { log("ac: " + path.slice(0, 40) + " status=" + r.status); throw kino.error("unavailable", "ac status " + r.status); }
+  try { return JSON.parse(t); } catch (e) { log("ac: json inválido " + path.slice(0, 40) + " inicio=" + redact(t.slice(0, 80))); throw kino.error("unavailable", "ac respuesta no válida"); }
+}
+function acImg(o) {
+  const im = (o && o.images) || {};
+  let p = String(im.poster || im.backdrop || (o && (o.poster || o.still_path)) || "");
+  if (!p) return undefined;
+  if (/^https?:\/\//i.test(p)) return p;
+  if (p.charAt(0) !== "/") p = "/" + p;
+  return p.indexOf("/wp-content/") === 0 ? AC + p : AC + "/wp-content/uploads" + p;
+}
+function acItem(o) {
+  const id = String((o && (o._id || o.id)) || "");
+  if (!id || !/^[A-Za-z0-9_-]+$/.test(id)) return null;
+  const type = String(o.type || o.post_type || "movies");
+  const title = String(o.title || o.name || "").replace(/\s*\(\d{4}\)\s*$/, "").trim();
+  const yr = /\b(19|20)\d{2}\b/.exec(String(o.year || o.release_date || ""));
+  return mkItem("ac", type === "movies" ? "movie" : "series", id, title, acImg(o), yr && yr[0]);
+}
+async function acSearch(q, postType) {
+  const types = "&post_type=" + (postType || "movies%2Ctvshows%2Canimes");
+  const run = async (w) => {
+    const d = await acJson("/search?query=" + enc(w) + "&page=1" + types + "&posts_per_page=16");
+    return (((d && d.data && d.data.posts) || []).map(acItem)).filter(Boolean);
+  };
+  let out = await run(q);
+  const want = normTitle(q);
+  const words = String(q).split(/\s+/).filter((w) => w.length > 3).sort((x, y) => y.length - x.length);
+  // La búsqueda del sitio a veces falla con varias palabras: se reintenta con la palabra más larga.
+  if (words.length && want.length > 4 && !out.some((it) => normTitle(it.title).indexOf(want) >= 0)) {
+    try { const more = await run(words[0]); const seen = new Set(out.map((x) => x.id)); more.forEach((x) => { if (!seen.has(x.id)) out.push(x); }); } catch (e) { /* nada */ }
+  }
+  if (want.length > 4 && out.some((it) => normTitle(it.title).indexOf(want) >= 0)) out = out.filter((it) => normTitle(it.title).indexOf(want) >= 0);
+  log("ac: búsqueda '" + String(q).slice(0, 30) + "' -> " + out.length + (out[0] ? " (" + String(out[0].title).slice(0, 30) + ")" : ""));
+  return out;
+}
+// El sitio no publica un listado conocido: el catálogo se arma buscando por año (como en el plugin FanPelis).
+const acCache = new Map();
+async function acPage(postType, n) {
+  if (n > 1) return { items: [], hasNext: false };
+  const hit = acCache.get(postType);
+  if (hit && Date.now() - hit.t < 5 * 60 * 1000) return hit.p;
+  const p = acPageGo(postType);
+  acCache.set(postType, { t: Date.now(), p });
+  p.catch(() => { acCache.delete(postType); });
+  return p;
+}
+async function acPageGo(postType) {
+  const res = await Promise.allSettled([2026, 2025, 2024].map((y) => acSearch(String(y), postType)));
+  const seen = new Set();
+  const items = [];
+  res.forEach((r) => { if (r.status === "fulfilled") r.value.forEach((it) => { if (!seen.has(it.id)) { seen.add(it.id); items.push(it); } }); });
+  if (!items.length) throw kino.error("unavailable", "ac sin catálogo");
+  return { items, hasNext: false };
+}
+async function acEpisodes(id) {
+  const d = await acJson("/episodes?post_id=" + enc(id));
+  const out = [];
+  for (const e of Array.isArray(d && d.data) ? d.data : []) {
+    const eid = e && (e._id || e.id);
+    if (!eid || !/^[A-Za-z0-9_-]+$/.test(String(eid))) continue;
+    const season = parseInt(e.season_number, 10) || 1;
+    const num = parseInt(e.episode_number, 10) || out.length + 1;
+    out.push({ season, number: num, ref: "ac|e|" + eid, title: stripTags(String(e.title || "")) || tr("Episodio ", "Episode ") + num, poster: acImg(e) });
+  }
+  log("ac: episodios " + out.length);
+  if (!out.length) throw kino.error("not_found", "ac sin capítulos");
+  out.sort((x, y) => (x.season - y.season) || (x.number - y.number));
+  return { series: { title: "" }, episodes: out };
+}
+async function acCandidates(spec) {
+  const p = spec.split("|");
+  const d = await acJson("/player?post_id=" + enc(p[1]) + "&_any=1");
+  const cands = [];
+  for (const e of (d && d.data && d.data.embeds) || []) {
+    const u = A(AC, e && e.url);
+    if (!u || !/^https:\/\//i.test(u)) continue;
+    const lang = langRank(String(e.lang || ""));
+    if (cands.some((x) => x.url === u)) continue;
+    cands.push({ url: u, lang, label: "AllCalidad · " + hostOf(u) + " · " + LANG_NAME[lang], referer: AC + "/" });
+  }
+  log("ac: servidores " + cands.length + " " + cands.map((c) => hostOf(c.url)).join(","));
+  return cands;
+}
+
 async function searchAll(qa, ms) {
-  const jobs = [["pg", pgSearch], ["ry", rySearch], ["pe", peSearch], ["op", opSearch]].filter(([n]) => !(deadUntil[n] > Date.now()));
+  const jobs = [["pg", pgSearch], ["pe", peSearch], ["op", opSearch], ["ac", (q) => acSearch(q)], ["ry", rySearch]].filter(([n]) => !(deadUntil[n] > Date.now()));
   const res = await Promise.allSettled(jobs.map(([, f]) => withTimeout(f(qa), Math.min(ms || 9000, 7000))));
   const all = [];
   res.forEach((r, i) => {
@@ -1170,6 +1262,7 @@ async function episodesOne(raw) {
   if (src === "ry") return ryEpisodes(dec(p[2]));
   if (src === "pe") return peEpisodes(dec(p[2]));
   if (src === "pg") return pgEpisodes(dec(p[2]));
+  if (src === "ac") return acEpisodes(p[2]);
   throw kino.error("not_found", "referencia desconocida");
 }
 
@@ -1193,7 +1286,8 @@ async function findMoreRefs(tt, refs, kind, ms) {
       const found = await searchAll(qa, ms);
       for (const it of found) {
         const src = it.ref.slice(0, 2);
-        if (have.has(src) || (it.kind === "movie") !== (kind === "m") || normTitle(it.title) !== want) continue;
+        if (have.has(src) || (it.kind === "movie") !== (kind === "m")) continue;
+        if (normTitle(it.title) !== want && loose(it.title) !== loose(title)) { log("otras fuentes: " + src + " no coincide '" + String(it.title).slice(0, 40) + "' con '" + title.slice(0, 40) + "'"); continue; }
         have.add(src);
         out.push(it.ref);
       }
@@ -1202,6 +1296,7 @@ async function findMoreRefs(tt, refs, kind, ms) {
   return out;
 }
 
+const loose = (t) => normTitle(String(t || "").replace(/\([^)]*\)|\[[^\]]*\]/g, " "));
 const epCache = new Map();
 
 export async function episodes(ref) {
@@ -1233,11 +1328,11 @@ export async function episodes(ref) {
   const okJob = (j) => j.done && j.value && j.value.episodes && j.value.episodes.length;
   const t0 = Date.now();
   let firstAt = 0;
-  while (Date.now() - t0 < 18000) {
+  while (Date.now() - t0 < 19000) {
     const pend = jobs.some((j) => !j.done) || searching;
     if (!pend) break;
     if (!firstAt && jobs.some(okJob)) firstAt = Date.now();
-    if (firstAt && Date.now() - firstAt > 2500) break;
+    if (firstAt && Date.now() - firstAt > (searching ? 9000 : 2500)) break;
     await kino.sleep(150);
   }
   const ok = jobs.filter(okJob);
@@ -1275,6 +1370,7 @@ async function candidatesOf(src, spec) {
   if (src === "ry") return ryCandidates(spec);
   if (src === "pe") return peCandidates(spec);
   if (src === "op") return opCandidates(spec);
+  if (src === "ac") return acCandidates(spec);
   throw kino.error("not_found", "referencia desconocida");
 }
 
@@ -1353,7 +1449,7 @@ export async function resolve(ref) {
       .catch(() => []);
   }
   cands = cands.filter((c, i) => cands.findIndex((x) => x.url === c.url) === i);
-  const useless = (c) => /dood|playmogo|doodstream|mixdrop|susanexpect|nupload|netu|waaw|hqq/i.test(hostOf(c.url));
+  const useless = (c) => /dood|pinup|agl00\d\.com|playmogo|doodstream|mixdrop|susanexpect|nupload|netu|waaw|hqq/i.test(hostOf(c.url));
   const usable = cands.filter((c) => !useless(c));
   if (usable.length) cands = usable;
   cands.sort((a, b) => ((a.lang || 0) * 10 + rank(a.url)) - ((b.lang || 0) * 10 + rank(b.url)));
